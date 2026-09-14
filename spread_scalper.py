@@ -15,7 +15,7 @@ sys.path.insert(0, "/Users/andreas/bitget_bot_v1")
 import bitget_client as client
 
 # ── Config ───────────────────────────────────────────────────────────────────
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]  # SOLUSDT entfernt (Learning: SOL-Shorts −1.97 USDT, gestern −3.06)
+SYMBOLS = ["ETHUSDT"]  # BTCUSDT entfernt (min_qty 0.001 @ ~$81k = $27 Margin > Konto $15.55); SOLUSDT (Learning −)
 LOOP_INTERVAL = 2          # Alle 2 Sekunden
 LEVERAGE = 3  # 3× Hebel (Backtest: V10 1× verliert 10× weniger als 5×)
 OFFSET_PCT = 0.0001        # 0.01% Offset (hauchduenn, um im Orderbook zu bleiben)
@@ -33,12 +33,11 @@ ANALYSIS_ENABLED = True   # False = deaktivieren (keine API-Kosten)
 # ── Shared State (Dashboard-Kommunikation) ──
 SHARED_STATE_PATH = os.path.join(os.path.dirname(__file__), "bot_state.json")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_MODEL = "deepseek-chat"      # DeepSeek-V3 (Flash), wechseln auf "deepseek-reasoner" für DeepSeek-R1/Pro
+DEEPSEEK_MODEL = "deepseek-v4-flash"   # deepseek-chat existiert nicht mehr (nur v4-pro/flash)
 
 # Symbol-spezifische Mindestmengen (updatet fuer 5 USDT Minimum UND Bitget Min-Qty Limits)
 MIN_SIZES = {
-    "BTCUSDT": 0.001,   # min_qty=0.001 → ~$63 (groesser als 5 USDT min)
-    "ETHUSDT": 0.05,    # min_qty erhöht auf 0.05 (war 0.01, zu klein) → ~$150
+    "ETHUSDT": 0.01,    # min_qty=0.01 → ~$25 (Konto $15.55, 3× = $8.4 Margin — passt)
     "SOLUSDT": 0.2,     # min_qty erhöht auf 0.2 (war 0.1) → ~$16
 }
 
@@ -541,6 +540,7 @@ Answer in GERMAN, max 2 sentences:
                     "pnl": float(pos.get("unrealizedPL", 0)),
                     "markPrice": float(pos.get("markPrice", 0)),
                     "margin": float(pos.get("marginSize", 0)),
+                    "created_ms": int(pos.get("cTime") or 0),
                 }
         except:
             pass
@@ -555,10 +555,22 @@ Answer in GERMAN, max 2 sentences:
     
     def place_limit_order(self, symbol, side, price, size):
         """Platziere Limit-Order (Post-Only = Maker)"""
+        # 💰 Balance-Check: Genug Margin frei? (verhindert 40762-Spam bei kleinem Konto)
+        try:
+            bal_data = client._get("/api/v2/mix/account/accounts", {"productType": "USDT-FUTURES"})
+            accts = bal_data.get("data") or []
+            if accts:
+                avail = float(accts[0].get("available", 0))
+                margin_needed = (float(price) * float(size)) / LEVERAGE
+                if avail < margin_needed * 0.8:  # 20% Puffer
+                    logger.warning(f"  ⏭️  {symbol} {side}: Nicht genug Margin (${avail:.2f} frei, ${margin_needed:.2f} nötig)")
+                    return "SKIP_MARGIN"
+        except:
+            pass
         notional = float(price) * float(size)
         if notional < 4.95:
             logger.warning(f"  ⚠️  {symbol} {side}: size={size} @ ${price} = ${notional:.2f} < $5 — SKIPPE Order")
-            return None
+            return "SKIP_NOTIONAL"
         order_side = "buy" if side == "long" else "sell"
         client_oid = f"{symbol}_{side}_{int(time.time()*1000)}_{os.urandom(2).hex()}"
         try:
@@ -853,6 +865,27 @@ Answer in GERMAN, max 2 sentences:
                                 self.positions.pop(symbol, None)
                                 self.peak_roe.pop(symbol, None)
                     
+                    # ── ⏰ Time-Stop (Learning 14.09.): >24h gehalten + ROE ≤ 0 → zwangsschließen ──
+                    # (Analyse 27.08.–14.09.: >8h-Positionen = Hauptverluste bei V1/V2;
+                    #  Simulation „Time-Stop 24h": −2.51 → +1.70 USDT ohne Crash-Fenster)
+                    try:
+                        created_ms = pos.get("created_ms") or 0
+                        if created_ms > 0:
+                            age_h = (time.time() * 1000 - created_ms) / 3600000
+                            if age_h >= 24:
+                                _margin = float(pos["size"]) * float(pos.get("markPrice", 0)) / LEVERAGE
+                                _roe = (float(pos.get("pnl", 0)) / _margin * 100) if _margin > 0 else 0
+                                if _roe <= 0:
+                                    _mp = float(pos.get("markPrice", 0))
+                                    logger.info(f"⏰ {symbol} Time-Stop: {age_h:.1f}h alt, ROE {_roe:.1f}% ≤ 0 — schließe {pos['side']}")
+                                    self.record_trade(symbol, pos["side"], pos["entry"], _mp, float(pos.get("pnl", 0)), "Time-Stop (>24h)")
+                                    self.place_market_close(symbol, pos["side"], pos["size"])
+                                    self.positions.pop(symbol, None)
+                                    self.peak_roe.pop(symbol, None)
+                                    continue
+                    except Exception as e:
+                        logger.debug(f"  ⏰ {symbol}: Time-Stop-Check: {e}")
+                    
                     # ── Dynamischer SL (alle 10s nachgeführt) ──
                     # ROE-basiertes Trailing: SL 2% unter Peak-ROE.
                     # Läuft bei jeder offenen Position kontinuierlich mit.
@@ -977,10 +1010,11 @@ Answer in GERMAN, max 2 sentences:
                         logger.debug(f"  ⏭️ {symbol}: Keine Coinglass-Signale — überspringe")
                         continue
 
-                    # 🕐 Handelsfenster-Sperre: Verluststunden 2-4/14/17/20/22 Uhr
-                    # (Simulation über 1577 Trades: diese Stunden = −323 USDT, 10-13 Uhr war GUT!)
+                    # 🕐 Handelsfenster-Sperre: Verluststunden 0-4/14/17/20/22 Uhr
+                    # (Runde 4: 2-4/14/17/20/22 aus 1577 Trades; 14.09.: 0+1 Uhr ergänzt —
+                    #  Nachtstunden 0-2 = −4.2 USDT bei 19 Trades in 2.5 Wochen)
                     _h = time.localtime().tm_hour
-                    if _h in (2, 3, 4, 14, 17, 20, 22):
+                    if _h in (0, 1, 2, 3, 4, 14, 17, 20, 22):
                         logger.info(f"  ⏭️ {symbol}: Handelsfenster gesperrt ({_h}:00, Verluststunde) — kein neuer Trade")
                         continue
 
@@ -1009,6 +1043,16 @@ Answer in GERMAN, max 2 sentences:
                         sell_id = self.place_limit_order(symbol, "short", round(ask_offset, price_place), order_size)
                         logger.info(f"  📉 {symbol}: SHORT Order | 📡 Funding {cg['funding_pct']:+.4f}% | OI {cg['oi_usd']/1e6:.0f}M$")
                     
+                    # SKIP_* (Margin/Notional) = KEIN Order-Versuch → buy_id/sell_id neutralisieren
+                    if buy_id in ("SKIP_MARGIN", "SKIP_NOTIONAL"):
+                        buy_id = None
+                    if sell_id in ("SKIP_MARGIN", "SKIP_NOTIONAL"):
+                        sell_id = None
+
+                    if not buy_id and not sell_id:
+                        logger.debug(f"  ⏭️ {symbol}: übersprungen (Margin/Notional) — kein Rate-Limit nötig")
+                        continue
+
                     if buy_id or sell_id:
                         self.pending_orders[symbol] = {"buy_id": buy_id, "sell_id": sell_id, "ts": time.time()}
                     
