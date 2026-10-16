@@ -37,7 +37,7 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"   # deepseek-chat existiert nicht mehr (nur
 
 # Symbol-spezifische Mindestmengen (updatet fuer 5 USDT Minimum UND Bitget Min-Qty Limits)
 MIN_SIZES = {
-    "ETHUSDT": 0.01,    # min_qty=0.01 → ~$25 (Konto $15.55, 3× = $8.4 Margin — passt)
+    "ETHUSDT": 0.01,    # min_qty=0.01 → ~$25 (Konto $15.55, 3× = $8.4 Margin — passt) | 14.09.: Exchange-Fix, kleiner nicht möglich
     "SOLUSDT": 0.2,     # min_qty erhöht auf 0.2 (war 0.1) → ~$16
 }
 
@@ -49,6 +49,12 @@ SL_BASE_MULT = 0.30     # 0.30× ATR baseline
 SL_MAX_MULT = 0.60      # 0.60× ATR bei Verlustserie (proportional zu SL_BASE)
 BREAKEVEN_PNL_PCT = 0.03  # +3% unrealized → move SL to entry
 LOSS_STREAK_THRESHOLD = 3  # Nach 3 Verlusten: scale SL bis 0.60×
+
+# 🛑 Tagesverlust-Bremse (MC-Finding 14.09.: V2 drosseln — Size ist durch
+# minTradeNum=0.01 fix (Exchange-Minimum), Risiko-Halbierung via Größe daher
+# nicht möglich → Frequenz-/Verlustkappung als Ersatz)
+DAILY_LOSS_LIMIT_PCT = 0.04    # > -4% realisierter Tagesverlust (Equity) → keine neuen Trades bis 00:00
+DAILY_LOSS_MIN_USDT = 0.30     # Fallback-Limit, wenn Balance nicht abrufbar
 
 # Preis-Rundung (Stellen nach Komma)
 PRICE_PLACES = {
@@ -87,6 +93,11 @@ class SpreadScalper:
         self.pending_orders = {}  # symbol -> {"buy_id": "...", "sell_id": "...", "ts": timestamp}
         self.last_pnl_check = {}  # symbol -> timestamp (10s-TP1-Cooldown)
         self.peak_roe = {}        # symbol -> höchster ROE% (für Trailing Stop)
+        self.daily_realized = 0.0 # heute realisierter PnL (Tagesverlust-Bremse, MC 14.09.)
+        self.daily_date = ""      # Kalendertag für den Reset der Bremse
+        self._equity_limit = DAILY_LOSS_MIN_USDT  # Tagesverlust-Limit USDT (wird aus Equity aktualisiert)
+        self._equity_ts = 0.0     # letzter Equity-Abruf (max. alle 10 min)
+        self._counted_fills = set()  # tradeIds bereits in daily_realized gezählter Fills
         
         # 🧠 Trade Learner
         self.trade_log = []  # Abgeschlossene Trades
@@ -106,6 +117,10 @@ class SpreadScalper:
         
         # Startup: Prüfe bestehende Positionen auf fehlende TP/SL
         self._check_existing_tpsl()
+
+        # Tagesverlust-Bremse: Tages-PnL aus Fills seeden (MC-Fix 16.09. — sonst blind
+        # für Closes während Bot-Downtime, z.B. Exchange-SL über Nacht)
+        self._seed_daily_realized()
     
     def _check_existing_tpsl(self):
         """Setze TP/SL fuer bestehende Positionen ohne — nutze ATR-basiertes Single TP"""
@@ -290,6 +305,9 @@ class SpreadScalper:
             "pnl": round(pnl, 4), "reason": reason,
         }
         self.trade_log.append(trade)
+
+        # Tagesverlust-Bremse: realisierten PnL mitschreiben (MC 14.09.)
+        self.daily_realized += float(pnl or 0)
         
         if symbol not in self.stats:
             self.stats[symbol] = {"trades": 0, "wins": 0, "losses": 0,
@@ -327,6 +345,26 @@ class SpreadScalper:
         icon = "✅" if pnl > 0 else "❌"
         logger.info(f"{icon} TRADE: {symbol} {side} | {pnl:+.4f} USDT | {reason}")
     
+    def _daily_loss_breaker_active(self):
+        """True, wenn der heute realisierte Verlust die MC-Bremse (14.09.) ausgelöst hat."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.daily_date != today:
+            self.daily_date = today
+            self.daily_realized = 0.0
+        if self.daily_realized >= 0:
+            return False  # kein Verlust heute → keine API-Calls
+        if time.time() - self._equity_ts > 600:  # Equity max. alle 10 min abrufen
+            self._equity_ts = time.time()
+            try:
+                b = client._get("/api/v2/mix/account/accounts", {"productType": "USDT-FUTURES"})
+                if isinstance(b, dict) and b.get("code") == "00000" and b.get("data"):
+                    eq = float(b["data"][0].get("accountEquity") or 0)
+                    if eq > 0:
+                        self._equity_limit = eq * DAILY_LOSS_LIMIT_PCT
+            except Exception:
+                pass
+        return self.daily_realized <= -abs(self._equity_limit)
+
     def print_stats(self):
         """Zeige gespeicherte Statistik"""
         if not self.stats:
@@ -912,6 +950,38 @@ Answer in GERMAN, max 2 sentences:
                                 if roe_pct > self.peak_roe.get(symbol, -9999):
                                     self.peak_roe[symbol] = roe_pct
 
+                                # ── 🛡️ 12h-Break-Even-SL (MC-Finding 14.09.) ──
+                                # >12h offen + im Plus + Trailing (<3% Peak) noch inaktiv
+                                # → SL auf Entry — Schutz vor späten Retracements
+                                # (hist. größter Einzelposten: 33–97h-Holds).
+                                if (self.peak_roe.get(symbol, 0) < (BREAKEVEN_PNL_PCT * 100)
+                                        and roe_pct >= 0.3):
+                                    try:
+                                        _cms = float(pos.get("created_ms") or 0)
+                                        _age_h = (time.time() * 1000 - _cms) / 3600000 if _cms > 0 else 0
+                                        if _age_h >= 12:
+                                            be_sl = round(entry_price, PRICE_PLACES.get(symbol, 2))
+                                            _cur = current_sl
+                                            if _cur is None:
+                                                try:
+                                                    _slr = pos.get("stopLoss")
+                                                    if _slr not in (None, "", "0"):
+                                                        _cur = float(_slr)
+                                                except Exception:
+                                                    _cur = None
+                                            _improves = (_cur is None
+                                                         or (side == "long" and _cur < be_sl)
+                                                         or (side == "short" and _cur > be_sl))
+                                            _safe = ((side == "long" and be_sl < mark * 0.9985)
+                                                     or (side == "short" and be_sl > mark * 1.0015))
+                                            if _improves and _safe:
+                                                self.positions.setdefault(symbol, {})["sl"] = be_sl
+                                                self.set_tpsl_for_position(symbol, side, tp_prices, be_sl, pos_size)
+                                                logger.info(f"🛡️ {symbol} {side.upper()}: 12h-BE-SL → {be_sl} (Entry | ROE {roe_pct:+.2f}% | {_age_h:.1f}h)")
+                                                self._notify_sl_move(symbol, side.upper(), roe_pct, be_sl)
+                                    except Exception as be_e:
+                                        logger.debug(f"  🛡️ BE-SL {symbol}: {be_e}")
+
                                 # ROE-Trailing: aktiv ab 3% Peak-ROE
                                 # SL immer auf Break-Even (Entry) sobald 3% erreicht,
                                 # danach 2% unter dem höchsten erreichten ROE nachführen
@@ -1016,6 +1086,11 @@ Answer in GERMAN, max 2 sentences:
                     _h = time.localtime().tm_hour
                     if _h in (0, 1, 2, 3, 4, 14, 17, 20, 22):
                         logger.info(f"  ⏭️ {symbol}: Handelsfenster gesperrt ({_h}:00, Verluststunde) — kein neuer Trade")
+                        continue
+
+                    # 🛑 Tagesverlust-Bremse (MC-Finding 14.09.: V2 drosseln)
+                    if self._daily_loss_breaker_active():
+                        logger.info(f"  ⏭️ {symbol}: Tagesverlust-Bremse aktiv ({self.daily_realized:+.2f} USDT heute) — keine neuen Trades")
                         continue
 
                     # 📡 Richtung per Funding-Signal entscheiden
@@ -1270,6 +1345,47 @@ Answer in GERMAN, max 2 sentences:
             except Exception as e:
                 logger.debug(f"  ⏭️  {symbol} verify: {e}")
     
+    def _fetch_realized_new(self, since_ms: float):
+        """Summe realisierter Fills (profit != 0, noch nicht gezählt) seit since_ms.
+
+        Markiert dabei ALLE gesehenen Fills in self._counted_fills → nie doppelt zählen.
+        Returns: Summe, oder None wenn kein Symbol abrufbar war.
+        """
+        total = 0.0
+        got = False
+        for sym in SYMBOLS:
+            try:
+                fl = client._get("/api/v2/mix/order/fills",
+                                 {"symbol": sym, "productType": "USDT-FUTURES", "limit": "50"})
+                if isinstance(fl, dict) and fl.get("code") == "00000":
+                    got = True
+                    rows = (fl.get("data") or {}).get("fillList") or []
+                    for f in rows:
+                        try:
+                            ct = float(f.get("cTime") or 0)
+                            fid = f.get("tradeId") or f.get("execId")
+                            if ct < since_ms or not fid or fid in self._counted_fills:
+                                continue
+                            self._counted_fills.add(fid)
+                            p = float(f.get("profit") or 0)
+                            if p:
+                                total += p
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        return total if got else None
+
+    def _seed_daily_realized(self):
+        """Startup: Tages-PnL aus Exchange-Fills rekonstruieren (MC-Bremse bleibt korrekt)."""
+        self.daily_date = datetime.now().strftime("%Y-%m-%d")  # sonst nullt der Datums-Reset den Seed
+        midnight_ms = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+        total = self._fetch_realized_new(midnight_ms)
+        if total is not None:
+            self.daily_realized = total
+            if total:
+                logger.info(f"🗓️ Tages-Bremse: heute bereits {total:+.2f} USDT realisiert (Seed aus Fills)")
+
     def _check_closed_positions(self):
         """Überprüfe ob Positionen geschlossen wurden (TP/SL Hit) und sende Telegram mit P&L"""
         for symbol in SYMBOLS:
@@ -1303,7 +1419,15 @@ Answer in GERMAN, max 2 sentences:
                         else:  # short
                             pnl = (entry_price - mark_price) * size
                             exit_reason = "TP hit" if mark_price < entry_price else "SL hit"
-                        
+
+                        # 🛑 Tagesverlust-Bremse: ECHTEN realisierten PnL aus den Fills holen
+                        # (Fund 16.09.: dieser Pfad deckte Exchange-seitige SL/TP-Hits ab,
+                        #  fütterte die Bremse aber nicht → 0 Auslösungen trotz Verlusttag)
+                        realized = self._fetch_realized_new(time.time() * 1000 - 180000)
+                        if realized is None:
+                            realized = pnl  # Fallback: Schätzung
+                        self.daily_realized += realized
+
                         # Telegram Nachricht mit P&L (nur TP, kein SL-Spam)
                         try:
                             if "TP" in exit_reason:  # Nur TP-Benachrichtigungen
@@ -1314,7 +1438,7 @@ Answer in GERMAN, max 2 sentences:
                                 tg.send(tg_msg)
                             else:
                                 icon = "⚪"
-                            logger.info(f"{icon} Position closed: {symbol} {side.upper()} | {pnl:+.4f} USDT | {exit_reason}")
+                            logger.info(f"{icon} Position closed: {symbol} {side.upper()} | {realized:+.4f} USDT (Fills) | {exit_reason}")
                         except Exception as tg_err:
                             logger.warning(f"  ⚠️  Telegram send failed: {tg_err}")
                         
